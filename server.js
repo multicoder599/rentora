@@ -63,19 +63,16 @@ const Message = mongoose.model('Message', new mongoose.Schema({
   name: String, email: String, message: String
 }, { timestamps: true }));
 
+// UPDATED: Viewing model to handle bookings + e-transfer status
 const Viewing = mongoose.model('Viewing', new mongoose.Schema({
-  userId: mongoose.Schema.Types.ObjectId, propertyId: mongoose.Schema.Types.ObjectId,
-  moveInDate: String, leaseTermMonths: Number
-}, { timestamps: true }));
-
-const Booking = mongoose.model('Booking', new mongoose.Schema({
   userId: mongoose.Schema.Types.ObjectId, 
   propertyId: mongoose.Schema.Types.ObjectId,
-  checkIn: String, 
-  checkOut: String, 
+  moveInDate: String, 
+  leaseTermMonths: Number,
   guests: Number,
-  status: { type: String, default: 'pending_payment' },
-  reference: String
+  status: { type: String, default: 'pending_payment' }, // pending_payment, awaiting_review, confirmed
+  confirmationCode: String,
+  amount: Number
 }, { timestamps: true }));
 
 const Faq = mongoose.model('Faq', new mongoose.Schema({
@@ -103,112 +100,124 @@ const hashPassword = (pw) => crypto.createHash('sha256').update(pw).digest('hex'
 app.post('/auth/register', authLimiter, async (req, res) => {
   try {
     const { name, email, password } = req.body;
-    if (await User.findOne({ email })) return res.status(409).json({ message: 'Email already in use.' });
     
+    if (await User.findOne({ email })) {
+      return res.status(409).json({ message: 'Email already in use.' });
+    }
+
     const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
-    const user = await User.create({ name, email, password: hashPassword(password), verificationCode });
+
+    const user = await User.create({ 
+      name, 
+      email, 
+      password: hashPassword(password),
+      verificationCode,
+      isVerified: false
+    });
 
     if (resend) {
       try {
         await resend.emails.send({
-          from: 'Rentora <onboarding@resend.dev>',
+          from: 'Rentora <verify@rentoracanada.com>',
           to: email,
           subject: 'Your Rentora Verification Code',
-          html: `<div style="text-align:center;"><h2>Welcome!</h2><h1 style="font-size:36px;">${verificationCode}</h1></div>`
+          html: `
+            <div style="font-family: sans-serif; text-align: center; padding: 20px;">
+              <h2 style="color: #2a5e3a;">Welcome to Rentora, ${name}!</h2>
+              <p>Your verification code is:</p>
+              <h1 style="font-size: 36px; letter-spacing: 8px; color: #e07a5f; margin: 20px 0;">${verificationCode}</h1>
+              <p>Enter this code on the website to activate your account.</p>
+            </div>
+          `
         });
-      } catch (err) { console.error('[Resend Error]', err); }
+      } catch (emailErr) {
+        console.error('[Resend Error]', emailErr);
+      }
     }
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.status(201).json({ token, user: { id: user._id, name, email, isVerified: false } });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
 
-app.post('/auth/login', authLimiter, async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const user = await User.findOne({ email });
-    if (!user || user.password !== hashPassword(password)) return res.status(401).json({ message: 'Invalid credentials' });
-    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { id: user._id, name: user.name, email: user.email, isVerified: user.isVerified } });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+  } catch (err) { 
+    res.status(500).json({ message: err.message }); 
+  }
 });
 
 app.post('/auth/verify-code', auth, async (req, res) => {
   try {
     const { code } = req.body;
     const user = await User.findById(req.user.id);
+
     if (!user) return res.status(404).json({ message: 'User not found' });
-    if (user.verificationCode !== code) return res.status(400).json({ message: 'Invalid code' });
+    if (user.isVerified) return res.status(400).json({ message: 'User already verified.' });
 
-    user.isVerified = true; user.verificationCode = undefined; await user.save();
-    res.json({ message: 'Verified!' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-app.post('/auth/resend-code', auth, async (req, res) => {
-  try {
-    const user = await User.findById(req.user.id);
-    if (!user || user.isVerified) return res.status(400).json({ message: 'Invalid request' });
-    
-    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
-    user.verificationCode = verificationCode; await user.save();
-
-    if (resend) {
-      await resend.emails.send({
-        from: 'Rentora <onboarding@resend.dev>',
-        to: user.email,
-        subject: 'Your NEW Rentora Verification Code',
-        html: `<div style="text-align:center;"><h2>New Code</h2><h1 style="font-size:36px;">${verificationCode}</h1></div>`
-      });
+    if (user.verificationCode !== code) {
+      return res.status(400).json({ message: 'Invalid verification code.' });
     }
-    res.json({ message: 'Code sent' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+
+    user.isVerified = true;
+    user.verificationCode = undefined;
+    await user.save();
+
+    res.json({ message: 'Email verified successfully!' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 });
 
-// --- BOOKINGS (e-Transfer flow) ---
-app.post('/bookings', auth, async (req, res) => {
+app.post('/auth/resend-code', authLimiter, auth, async (req, res) => {
+    try {
+      const user = await User.findById(req.user.id);
+      if (!user) return res.status(404).json({ message: 'User not found' });
+      if (user.isVerified) return res.status(400).json({ message: 'User is already verified.' });
+  
+      const newCode = Math.floor(100000 + Math.random() * 900000).toString();
+      user.verificationCode = newCode;
+      await user.save();
+  
+      if (resend) {
+        try {
+          await resend.emails.send({
+            from: 'Rentora <onboarding@resend.dev>',
+            to: user.email,
+            subject: 'Your NEW Rentora Verification Code',
+            html: `
+              <div style="font-family: sans-serif; text-align: center; padding: 20px;">
+                <h2 style="color: #2a5e3a;">Here is your new code, ${user.name}!</h2>
+                <h1 style="font-size: 36px; letter-spacing: 8px; color: #e07a5f; margin: 20px 0;">${newCode}</h1>
+                <p>Enter this code on the website to activate your account.</p>
+              </div>
+            `
+          });
+        } catch (emailErr) {
+          console.error('[Resend Error]', emailErr);
+          return res.status(500).json({ message: 'Failed to send email. Please try again later.' });
+        }
+      }
+  
+      res.json({ message: 'A new verification code has been sent to your email.' });
+    } catch (err) {
+      res.status(500).json({ message: err.message });
+    }
+  });
+
+app.post('/auth/login', authLimiter, async (req, res) => {
   try {
-    const { propertyId, checkIn, checkOut, guests } = req.body;
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
     
-    // Generate a unique reference code (e.g. MH-A4AGWY)
-    const reference = 'MH-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+    if (!user || user.password !== hashPassword(password)) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
 
-    const booking = await Booking.create({ 
-      userId: req.user.id, 
-      propertyId, 
-      checkIn, 
-      checkOut, 
-      guests,
-      reference,
-      status: 'pending_payment'
-    });
-
-    res.status(201).json({ message: 'Booking created', booking });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user._id, name: user.name, email: user.email, isVerified: user.isVerified } });
+  } catch (err) { 
+    res.status(500).json({ message: err.message }); 
+  }
 });
 
-// Fetch user's bookings for Dashboard
-app.get('/bookings/me', auth, async (req, res) => {
-  try {
-    const bookings = await Booking.find({ userId: req.user.id }).populate('propertyId', 'name city province image price');
-    res.json(bookings);
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-// Mark booking as paid
-app.post('/bookings/:id/pay', auth, async (req, res) => {
-  try {
-    await Booking.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user.id },
-      { status: 'confirmed' }
-    );
-    res.json({ message: 'Payment confirmed' });
-  } catch (err) { res.status(500).json({ message: err.message }); }
-});
-
-
-// --- PROPERTIES & OTHER ---
+// --- PROPERTIES ---
 app.get('/properties', async (req, res) => {
   try {
     const { q, province, city, type, sort, page = 1, limit = 12, featured } = req.query;
@@ -236,13 +245,17 @@ app.get('/properties', async (req, res) => {
 
 app.get('/properties/stats/cities', async (req, res) => {
   try {
-    const stats = await Property.aggregate([{ $group: { _id: "$city", count: { $sum: 1 } } }, { $project: { city: "$_id", count: 1, _id: 0 } }]);
+    const stats = await Property.aggregate([
+      { $group: { _id: "$city", count: { $sum: 1 } } },
+      { $project: { city: "$_id", count: 1, _id: 0 } }
+    ]);
     res.json(stats);
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 app.get('/properties/count', async (req, res) => {
-  try { res.json({ count: await Property.countDocuments() }); } catch (err) { res.status(500).json({ message: err.message }); }
+  try { res.json({ count: await Property.countDocuments() }); } 
+  catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 app.get('/properties/:id', async (req, res) => {
@@ -253,6 +266,7 @@ app.get('/properties/:id', async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// --- LOCATIONS ---
 app.get('/locations/cities', async (req, res) => {
   try {
     const { province } = req.query;
@@ -262,6 +276,7 @@ app.get('/locations/cities', async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// --- FAVORITES ---
 app.post('/favorites', auth, async (req, res) => {
   try {
     await Favorite.create({ userId: req.user.id, propertyId: req.body.propertyId });
@@ -276,12 +291,19 @@ app.delete('/favorites/:propertyId', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// --- CONTACT & FAQ & SITE STATS ---
 app.post('/contact', authLimiter, async (req, res) => {
-  try { await Message.create(req.body); res.status(201).json({ message: 'Sent' }); } catch (err) { res.status(500).json({ message: err.message }); }
+  try {
+    await Message.create(req.body);
+    res.status(201).json({ message: 'Sent' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 app.get('/faq', async (req, res) => {
-  try { res.json(await Faq.find().sort({ order: 1 })); } catch (err) { res.status(500).json({ message: err.message }); }
+  try {
+    const faqs = await Faq.find().sort({ order: 1 });
+    res.json(faqs);
+  } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
 app.get('/site/stats', async (req, res) => {
@@ -295,6 +317,57 @@ app.get('/site/stats', async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
+// --- BOOKINGS & VIEWINGS ---
+app.post('/viewings', auth, async (req, res) => {
+  try {
+    const { propertyId, moveInDate, leaseTermMonths } = req.body;
+    await Viewing.create({ userId: req.user.id, propertyId, moveInDate, leaseTermMonths });
+    res.status(201).json({ message: 'Viewing requested successfully' });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// NEW: Create a booking with payment info
+app.post('/bookings', auth, async (req, res) => {
+  try {
+    const { propertyId, checkIn, checkOut, guests, amount } = req.body;
+    
+    // Generate a unique confirmation code (e.g. MH-A4AGWY)
+    const code = 'MH-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+
+    const booking = await Viewing.create({ 
+      userId: req.user.id, 
+      propertyId, 
+      moveInDate: checkIn, // Mapping front-end checkIn to Viewing moveInDate
+      guests,
+      confirmationCode: code,
+      amount: amount || 0,
+      status: 'pending_payment' 
+    });
+    
+    res.status(201).json({ message: 'Booking pending e-transfer', booking });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// NEW: Mark payment as sent
+app.patch('/bookings/:id/pay', auth, async (req, res) => {
+  try {
+    const booking = await Viewing.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user.id },
+      { status: 'awaiting_review' },
+      { new: true }
+    );
+    if (!booking) return res.status(404).json({ message: 'Booking not found' });
+    res.json({ message: 'Payment marked as sent', booking });
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
+
+// NEW: Fetch user bookings for Dashboard
+app.get('/my-bookings', auth, async (req, res) => {
+  try {
+    const bookings = await Viewing.find({ userId: req.user.id }).populate('propertyId').sort({ createdAt: -1 });
+    res.json(bookings);
+  } catch (err) { res.status(500).json({ message: err.message }); }
+});
 
 // ─────────────────────────────────────────────────────────
 // 4. START
@@ -307,6 +380,9 @@ async function start() {
     await mongoose.connect(process.env.MONGO_URI);
     console.log('[db] connected');
     app.listen(PORT, () => console.log(`[api] listening on ${PORT}`));
-  } catch (err) { process.exit(1); }
+  } catch (err) { 
+    console.error('[fatal] Failed to start:', err.message);
+    process.exit(1); 
+  }
 }
 start();
