@@ -63,14 +63,13 @@ const Message = mongoose.model('Message', new mongoose.Schema({
   name: String, email: String, message: String
 }, { timestamps: true }));
 
-// UPDATED: Viewing model to handle bookings + e-transfer status
 const Viewing = mongoose.model('Viewing', new mongoose.Schema({
   userId: mongoose.Schema.Types.ObjectId, 
   propertyId: mongoose.Schema.Types.ObjectId,
   moveInDate: String, 
   leaseTermMonths: Number,
   guests: Number,
-  status: { type: String, default: 'pending_payment' }, // pending_payment, awaiting_review, confirmed
+  status: { type: String, default: 'pending_payment' }, 
   confirmationCode: String,
   amount: Number
 }, { timestamps: true }));
@@ -96,7 +95,6 @@ const hashPassword = (pw) => crypto.createHash('sha256').update(pw).digest('hex'
 // 3. ROUTES
 // ─────────────────────────────────────────────────────────
 
-// --- AUTH ---
 app.post('/auth/register', authLimiter, async (req, res) => {
   try {
     const { name, email, password } = req.body;
@@ -218,15 +216,22 @@ app.post('/auth/login', authLimiter, async (req, res) => {
 });
 
 // --- PROPERTIES ---
+// FIXED: Correctly filters by type (?type=stay vs ?type=rental)
 app.get('/properties', async (req, res) => {
   try {
     const { q, province, city, type, sort, page = 1, limit = 12, featured } = req.query;
     let query = {};
+    
     if (q) query.name = { $regex: q, $options: 'i' };
     if (province) query.province = province;
     if (city) query.city = city;
-    if (type) query.type = type;
-    if (featured) query.featured = true;
+    
+    // This is the key fix: only apply the filter if `type` has a value
+    if (type && type.trim() !== "") {
+      query.type = type; 
+    }
+    
+    if (featured === 'true') query.featured = true;
 
     let sortOptions = {};
     if (sort === 'price_asc') sortOptions.price = 1;
@@ -326,18 +331,16 @@ app.post('/viewings', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// NEW: Create a booking with payment info
 app.post('/bookings', auth, async (req, res) => {
   try {
     const { propertyId, checkIn, checkOut, guests, amount } = req.body;
     
-    // Generate a unique confirmation code (e.g. MH-A4AGWY)
     const code = 'MH-' + Math.random().toString(36).substring(2, 8).toUpperCase();
 
     const booking = await Viewing.create({ 
       userId: req.user.id, 
       propertyId, 
-      moveInDate: checkIn, // Mapping front-end checkIn to Viewing moveInDate
+      moveInDate: checkIn, 
       guests,
       confirmationCode: code,
       amount: amount || 0,
@@ -348,7 +351,6 @@ app.post('/bookings', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// NEW: Mark payment as sent
 app.patch('/bookings/:id/pay', auth, async (req, res) => {
   try {
     const booking = await Viewing.findOneAndUpdate(
@@ -361,7 +363,6 @@ app.patch('/bookings/:id/pay', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// NEW: Fetch user bookings for Dashboard
 app.get('/my-bookings', auth, async (req, res) => {
   try {
     const bookings = await Viewing.find({ userId: req.user.id }).populate('propertyId').sort({ createdAt: -1 });
@@ -369,9 +370,6 @@ app.get('/my-bookings', auth, async (req, res) => {
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
 
-// ─────────────────────────────────────────────────────────
-// 4. START
-// ─────────────────────────────────────────────────────────
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 app.use((req, res) => res.status(404).json({ message: 'Not found' }));
 
