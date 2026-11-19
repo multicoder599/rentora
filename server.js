@@ -11,6 +11,10 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const { Resend } = require('resend'); // <-- Import Resend
+
+// Initialize Resend (if API key exists)
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 const REQUIRED = ['MONGO_URI', 'JWT_SECRET'];
 if (REQUIRED.some(k => !process.env[k])) {
@@ -37,7 +41,11 @@ const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30 });
 // 1. MODELS
 // ─────────────────────────────────────────────────────────
 const User = mongoose.model('User', new mongoose.Schema({
-  name: String, email: { type: String, unique: true }, password: String
+  name: String, 
+  email: { type: String, unique: true }, 
+  password: String,
+  isVerified: { type: Boolean, default: false }, // <-- Added
+  verificationToken: String // <-- Added
 }, { timestamps: true }));
 
 const Property = mongoose.model('Property', new mongoose.Schema({
@@ -91,21 +99,98 @@ const hashPassword = (pw) => crypto.createHash('sha256').update(pw).digest('hex'
 app.post('/auth/register', authLimiter, async (req, res) => {
   try {
     const { name, email, password } = req.body;
-    if (await User.findOne({ email })) return res.status(409).json({ message: 'Email already in use.' });
-    const user = await User.create({ name, email, password: hashPassword(password) });
+    
+    if (await User.findOne({ email })) {
+      return res.status(409).json({ message: 'Email already in use.' });
+    }
+
+    // Generate a random 32-character hex token
+    const verificationToken = crypto.randomBytes(16).toString('hex');
+
+    const user = await User.create({ 
+      name, 
+      email, 
+      password: hashPassword(password),
+      verificationToken,
+      isVerified: false
+    });
+
+    // Send Verification Email via Resend
+    if (resend) {
+      const verifyUrl = `https://api.rentoracanada.com/auth/verify/${verificationToken}`;
+      try {
+        await resend.emails.send({
+          from: 'Rentora <onboarding@resend.dev>', // Replace with your verified domain later (e.g. hello@rentoracanada.com)
+          to: email,
+          subject: 'Verify your Rentora account',
+          html: `
+            <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; color: #1a1a1a;">
+              <h2 style="font-family: Georgia, serif; color: #2a5e3a;">Welcome to Rentora, ${name}!</h2>
+              <p>Please verify your email address to complete your registration.</p>
+              <a href="${verifyUrl}" style="display: inline-block; background-color: #e07a5f; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; margin: 16px 0;">Verify Email Address</a>
+              <p>Or copy and paste this link into your browser:</p>
+              <p><a href="${verifyUrl}" style="color: #2a5e3a;">${verifyUrl}</a></p>
+              <p style="color: #6b6560; font-size: 12px; margin-top: 32px;">If you didn't create an account, you can safely ignore this email.</p>
+            </div>
+          `
+        });
+      } catch (emailErr) {
+        console.error('[Resend Error]', emailErr);
+        // We don't fail the registration if the email fails, but we log it.
+      }
+    }
+
+    // Note: We no longer return the JWT token here immediately if we want them to verify first.
+    // However, to keep your current frontend working, we'll still return the token,
+    // but the user's `isVerified` will be false in the DB.
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.status(201).json({ token, user: { id: user._id, name, email } });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+    res.status(201).json({ token, user: { id: user._id, name, email, isVerified: false } });
+
+  } catch (err) { 
+    res.status(500).json({ message: err.message }); 
+  }
 });
 
+// --- VERIFY EMAIL ROUTE ---
+app.get('/auth/verify/:token', async (req, res) => {
+  try {
+    const user = await User.findOne({ verificationToken: req.params.token });
+    
+    if (!user) {
+      return res.status(400).send('<h1>Invalid or expired verification link.</h1>');
+    }
+
+    user.isVerified = true;
+    user.verificationToken = undefined; // Clear the token
+    await user.save();
+
+    // Redirect the user back to the frontend login page with a success flag
+    res.redirect('https://rentoracanada.com/login?verified=true');
+  } catch (err) {
+    res.status(500).send('<h1>Something went wrong during verification.</h1>');
+  }
+});
+
+// --- LOGIN ---
 app.post('/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     const user = await User.findOne({ email });
-    if (!user || user.password !== hashPassword(password)) return res.status(401).json({ message: 'Invalid credentials' });
+    
+    if (!user || user.password !== hashPassword(password)) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    // Optional: Block login if not verified
+    // if (!user.isVerified) {
+    //   return res.status(403).json({ message: 'Please verify your email before logging in.' });
+    // }
+
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { id: user._id, name: user.name, email: user.email } });
-  } catch (err) { res.status(500).json({ message: err.message }); }
+    res.json({ token, user: { id: user._id, name: user.name, email: user.email, isVerified: user.isVerified } });
+  } catch (err) { 
+    res.status(500).json({ message: err.message }); 
+  }
 });
 
 // --- PROPERTIES ---
@@ -162,7 +247,6 @@ app.get('/locations/cities', async (req, res) => {
   try {
     const { province } = req.query;
     if (!province) return res.json([]);
-    
     const cities = await Property.distinct('city', { province });
     res.json(cities.sort()); 
   } catch (err) { res.status(500).json({ message: err.message }); }
@@ -225,7 +309,6 @@ app.post('/bookings', auth, async (req, res) => {
     res.status(201).json({ message: 'Booking confirmed successfully' });
   } catch (err) { res.status(500).json({ message: err.message }); }
 });
-
 
 // ─────────────────────────────────────────────────────────
 // 4. START
