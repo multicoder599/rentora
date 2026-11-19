@@ -165,6 +165,43 @@ app.post('/auth/verify-code', auth, async (req, res) => {
   }
 });
 
+// --- RESEND CODE ROUTE ---
+app.post('/auth/resend-code', authLimiter, auth, async (req, res) => {
+    try {
+      const user = await User.findById(req.user.id);
+      if (!user) return res.status(404).json({ message: 'User not found' });
+      if (user.isVerified) return res.status(400).json({ message: 'User is already verified.' });
+  
+      // Generate a new 6-digit code
+      const newCode = Math.floor(100000 + Math.random() * 900000).toString();
+      user.verificationCode = newCode;
+      await user.save();
+  
+      if (resend) {
+        try {
+          await resend.emails.send({
+            from: 'Rentora <onboarding@resend.dev>', // Change this once your domain is verified
+            to: user.email,
+            subject: 'Your NEW Rentora Verification Code',
+            html: `
+              <div style="font-family: sans-serif; text-align: center; padding: 20px;">
+                <h2 style="color: #2a5e3a;">Here is your new code, ${user.name}!</h2>
+                <h1 style="font-size: 36px; letter-spacing: 8px; color: #e07a5f; margin: 20px 0;">${newCode}</h1>
+                <p>Enter this code on the website to activate your account.</p>
+              </div>
+            `
+          });
+        } catch (emailErr) {
+          console.error('[Resend Error]', emailErr);
+          return res.status(500).json({ message: 'Failed to send email. Please try again later.' });
+        }
+      }
+  
+      res.json({ message: 'A new verification code has been sent to your email.' });
+    } catch (err) {
+      res.status(500).json({ message: err.message });
+    }
+  });
 // --- LOGIN ---
 app.post('/auth/login', authLimiter, async (req, res) => {
   try {
