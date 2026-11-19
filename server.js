@@ -117,7 +117,7 @@ app.post('/auth/register', authLimiter, async (req, res) => {
     if (resend) {
       try {
         await resend.emails.send({
-          from: 'Rentora <onboarding@resend.dev>',
+          from: 'Rentora <verify@rentoracanada.com>',
           to: email,
           subject: 'Your Rentora Verification Code',
           html: `
