@@ -11,9 +11,8 @@ const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const { Resend } = require('resend'); // <-- Import Resend
+const { Resend } = require('resend');
 
-// Initialize Resend (if API key exists)
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 const REQUIRED = ['MONGO_URI', 'JWT_SECRET'];
@@ -44,8 +43,8 @@ const User = mongoose.model('User', new mongoose.Schema({
   name: String, 
   email: { type: String, unique: true }, 
   password: String,
-  isVerified: { type: Boolean, default: false }, // <-- Added
-  verificationToken: String // <-- Added
+  isVerified: { type: Boolean, default: false },
+  verificationCode: String // Stores the 6-digit code
 }, { timestamps: true }));
 
 const Property = mongoose.model('Property', new mongoose.Schema({
@@ -104,45 +103,37 @@ app.post('/auth/register', authLimiter, async (req, res) => {
       return res.status(409).json({ message: 'Email already in use.' });
     }
 
-    // Generate a random 32-character hex token
-    const verificationToken = crypto.randomBytes(16).toString('hex');
+    // Generate 6-digit code
+    const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
 
     const user = await User.create({ 
       name, 
       email, 
       password: hashPassword(password),
-      verificationToken,
+      verificationCode,
       isVerified: false
     });
 
-    // Send Verification Email via Resend
     if (resend) {
-      const verifyUrl = `https://api.rentoracanada.com/auth/verify/${verificationToken}`;
       try {
         await resend.emails.send({
-          from: 'Rentora <onboarding@resend.dev>', // Replace with your verified domain later (e.g. hello@rentoracanada.com)
+          from: 'Rentora <onboarding@resend.dev>',
           to: email,
-          subject: 'Verify your Rentora account',
+          subject: 'Your Rentora Verification Code',
           html: `
-            <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; color: #1a1a1a;">
-              <h2 style="font-family: Georgia, serif; color: #2a5e3a;">Welcome to Rentora, ${name}!</h2>
-              <p>Please verify your email address to complete your registration.</p>
-              <a href="${verifyUrl}" style="display: inline-block; background-color: #e07a5f; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; margin: 16px 0;">Verify Email Address</a>
-              <p>Or copy and paste this link into your browser:</p>
-              <p><a href="${verifyUrl}" style="color: #2a5e3a;">${verifyUrl}</a></p>
-              <p style="color: #6b6560; font-size: 12px; margin-top: 32px;">If you didn't create an account, you can safely ignore this email.</p>
+            <div style="font-family: sans-serif; text-align: center; padding: 20px;">
+              <h2 style="color: #2a5e3a;">Welcome to Rentora, ${name}!</h2>
+              <p>Your verification code is:</p>
+              <h1 style="font-size: 36px; letter-spacing: 8px; color: #e07a5f; margin: 20px 0;">${verificationCode}</h1>
+              <p>Enter this code on the website to activate your account.</p>
             </div>
           `
         });
       } catch (emailErr) {
         console.error('[Resend Error]', emailErr);
-        // We don't fail the registration if the email fails, but we log it.
       }
     }
 
-    // Note: We no longer return the JWT token here immediately if we want them to verify first.
-    // However, to keep your current frontend working, we'll still return the token,
-    // but the user's `isVerified` will be false in the DB.
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.status(201).json({ token, user: { id: user._id, name, email, isVerified: false } });
 
@@ -151,23 +142,26 @@ app.post('/auth/register', authLimiter, async (req, res) => {
   }
 });
 
-// --- VERIFY EMAIL ROUTE ---
-app.get('/auth/verify/:token', async (req, res) => {
+// --- VERIFY CODE ROUTE ---
+app.post('/auth/verify-code', auth, async (req, res) => {
   try {
-    const user = await User.findOne({ verificationToken: req.params.token });
-    
-    if (!user) {
-      return res.status(400).send('<h1>Invalid or expired verification link.</h1>');
+    const { code } = req.body;
+    const user = await User.findById(req.user.id);
+
+    if (!user) return res.status(404).json({ message: 'User not found' });
+    if (user.isVerified) return res.status(400).json({ message: 'User already verified.' });
+
+    if (user.verificationCode !== code) {
+      return res.status(400).json({ message: 'Invalid verification code.' });
     }
 
     user.isVerified = true;
-    user.verificationToken = undefined; // Clear the token
+    user.verificationCode = undefined;
     await user.save();
 
-    // Redirect the user back to the frontend login page with a success flag
-    res.redirect('https://rentoracanada.com/login?verified=true');
+    res.json({ message: 'Email verified successfully!' });
   } catch (err) {
-    res.status(500).send('<h1>Something went wrong during verification.</h1>');
+    res.status(500).json({ message: err.message });
   }
 });
 
