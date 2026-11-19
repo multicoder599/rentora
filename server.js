@@ -22,7 +22,10 @@ if (missing.length) {
 
 const PORT = Number(process.env.PORT) || 5109;
 const NODE_ENV = process.env.NODE_ENV || 'development';
-const CORS_ORIGINS = (process.env.CORS_ORIGINS || 'http://localhost:5173')
+
+// Default to your production domains if not set in .env
+const defaultOrigins = 'https://rentoracanada.com,https://www.rentoracanada.com,http://localhost:5173,http://localhost:3000';
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || defaultOrigins)
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
@@ -31,19 +34,25 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || 'http://localhost:5173')
 // 2. App + middleware
 // ─────────────────────────────────────────────────────────
 const app = express();
-app.set('trust proxy', 1); // needed for correct IPs behind Render/Fly/Heroku
+app.set('trust proxy', 1); // needed for correct IPs behind Nginx/Cloudflare
 
-app.use(helmet());
+// Cloudflare sends X-Forwarded-Proto; this ensures Express knows it's HTTPS
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" } // Allow images/assets if needed
+}));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 app.use(
   cors({
     origin(origin, cb) {
-      // Allow no-origin (curl, same-origin, server-to-server)
+      // Allow no-origin (curl, server-to-server)
       if (!origin) return cb(null, true);
       if (CORS_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error(`Origin ${origin} not allowed by CORS`));
+      
+      // Do not throw an error (which would 500 the server), just deny CORS
+      console.warn(`[cors] Blocked request from origin: ${origin}`);
+      return cb(null, false);
     },
     credentials: true
   })
@@ -61,7 +70,7 @@ const authLimiter = rateLimit({
 });
 
 // ─────────────────────────────────────────────────────────
-// 3. Health check (useful for Render / Fly / Uptime)
+// 3. Health check
 // ─────────────────────────────────────────────────────────
 app.get('/healthz', (_req, res) => {
   res.json({
@@ -73,9 +82,9 @@ app.get('/healthz', (_req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────
-// 4. Routes — mount as you build them
+// 4. Routes
 // ─────────────────────────────────────────────────────────
-// app.use('/auth',         require('./routes/auth'));
+// app.use('/auth',         authLimiter, require('./routes/auth'));
 // app.use('/properties',   require('./routes/properties'));
 // app.use('/viewings',     require('./routes/viewings'));
 // app.use('/bookings',     require('./routes/bookings'));
@@ -87,7 +96,12 @@ app.get('/healthz', (_req, res) => {
 
 // Simple root so hitting the base URL doesn't 404
 app.get('/', (_req, res) => {
-  res.json({ name: 'Rentora API', version: '1.0.0', docs: '/healthz' });
+  res.json({ 
+    name: 'Rentora API', 
+    version: '1.0.0', 
+    docs: '/healthz',
+    status: 'online'
+  });
 });
 
 // ─────────────────────────────────────────────────────────
@@ -120,6 +134,7 @@ async function start() {
 
     const server = app.listen(PORT, () => {
       console.log(`[api] listening on http://localhost:${PORT} (${NODE_ENV})`);
+      console.log(`[cors] Allowed origins: ${CORS_ORIGINS.join(', ')}`);
     });
 
     // Graceful shutdown
