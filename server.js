@@ -175,11 +175,6 @@ app.post('/auth/login', authLimiter, async (req, res) => {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    // Optional: Block login if not verified
-    // if (!user.isVerified) {
-    //   return res.status(403).json({ message: 'Please verify your email before logging in.' });
-    // }
-
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
     res.json({ token, user: { id: user._id, name: user.name, email: user.email, isVerified: user.isVerified } });
   } catch (err) { 
